@@ -122,8 +122,12 @@ table.tbl td{padding:8px 4px;border-bottom:1px solid var(--line);}
    ========================================================= */
 var STORE_KEY = 'peixiao_manager_v1';
 var CLOUD_CFG = {
-  rawUrl:   'https://raw.githubusercontent.com/chenziyi-dd/tuition-data/main/data.enc',
-  apiData:  'https://api.github.com/repos/chenziyi-dd/tuition-data/contents/data.enc',
+  rawUrls: [
+    'https://chenziyi-dd.github.io/tuition-app/data.enc',
+    'https://cdn.jsdelivr.net/gh/chenziyi-dd/tuition-app@main/data.enc',
+    'https://raw.githubusercontent.com/chenziyi-dd/tuition-app/main/data.enc'
+  ],
+  apiData:  'https://api.github.com/repos/chenziyi-dd/tuition-app/contents/data.enc',
   pbkdf2Iter: 100000
 };
 /* 写入令牌：仅管理员设备需要，粘贴一次保存在本机浏览器，绝不上传网页/云端 */
@@ -185,8 +189,8 @@ var CRYPTO = {
 
 /* ---------- 云同步状态 ---------- */
 var cloud = { blob:null, status:'未同步', pendingPush:false, masterKey:null, wrapCache:{}, lastSync:'' };
-function cloudFetch(){
-  return fetch(CLOUD_CFG.rawUrl + '?t=' + Date.now(), {cache:'no-store'}).then(function(r){
+function cloudFetchOne(url){
+  return fetch(url + (url.indexOf('?')<0?'?t=':'&t=') + Date.now(), {cache:'no-store'}).then(function(r){
     if(!r.ok) throw new Error('HTTP '+r.status);
     return r.text();
   }).then(function(txt){
@@ -197,6 +201,14 @@ function cloudFetch(){
     localStorage.setItem('peixiao_cloud_cache', JSON.stringify(blob));
     return blob;
   });
+}
+function cloudFetch(){
+  var urls = CLOUD_CFG.rawUrls.slice();
+  function tryNext(){
+    if(!urls.length) return Promise.reject(new Error('所有云端通道均不可用'));
+    return cloudFetchOne(urls.shift()).catch(function(){ return tryNext(); });
+  }
+  return tryNext();
 }
 function cloudFetchWithCache(){
   return cloudFetch().catch(function(e){
