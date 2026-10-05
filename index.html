@@ -839,6 +839,10 @@ function showStudentDetail(stuId){
     var clsName = e.classId && getClass(e.classId) ? ' · 班级：'+esc(getClass(e.classId).name) : '';
     h+='<div class="card"><h3>'+esc(e.course)+' <span class="badge '+(e.enrollType==='续费'?'green':'blue')+'">'+esc(e.enrollType||'新签')+'</span> <span class="badge blue">剩 '+es.remain+' / '+es.total+' 节</span></h3>'+
     '<div class="desc" style="font-size:12px;color:var(--text2);margin-bottom:6px;">授课老师：'+esc(t?t.name:'已删除')+'（'+esc(t?t.subject:'')+'） · 总学费：'+money(e.totalFee)+' · 报名日期：'+esc(e.enrollDate||'-')+clsName+'</div>'+
+    '<div style="display:flex;gap:8px;margin-bottom:8px;">'+
+    '<button class="btn sm" onclick="openEditEnrollForm(\''+stuId+'\',\''+e.id+'\')">✏️ 修改报名</button>'+
+    '<button class="btn sm danger" onclick="delEnroll(\''+stuId+'\',\''+e.id+'\')">🗑️ 删除报名</button>'+
+    '</div>'+
     '<table class="tbl"><tr><th>上课日期</th><th>状态</th><th style="text-align:right;">操作</th></tr>';
     e.sessions.forEach(function(s,idx){
       var badge;
@@ -1040,6 +1044,121 @@ function saveEnrollment(stuId){
   addLog('报名缴费', st.name+'【'+etype+'】报名「'+course+'」'+cname+'（'+(t?t.name:'')+'）：共'+tmpDates.length+'节课，学费'+money(fee)+'（'+edate+'），已录入 '+tmpDates.length+' 个上课日期');
   saveData(); closeModal();
   autoConsume();
+  showStudentDetail(stuId);
+}
+
+/* ---------- 修改/删除报名（2026-10-05 新增） ---------- */
+var tmpSess=[]; /* 编辑报名时的课次副本 */
+function openEditEnrollForm(stuId, enrollId){
+  var st=getStudent(stuId); if(!st) return;
+  var e=null; st.enrollments.forEach(function(x){ if(x.id===enrollId) e=x; });
+  if(!e){ alert('未找到该报名记录'); return; }
+  tmpSess = e.sessions.map(function(s){ return {date:s.date, status:s.status, lessonId:s.lessonId}; });
+  var t=getTeacher(e.teacherId);
+  var teacherHtml;
+  if(e.classId){
+    var c=getClass(e.classId);
+    teacherHtml='<div class="form-item"><label>授课老师 / 课程</label><input value="'+esc((t?t.name:'')+' · '+(c?c.name:e.course))+'" disabled><div class="hint">班级报名的老师与课程由班级带出，不可修改；可改的是报名类型、日期、学费和上课日期</div></div>';
+  }else{
+    var opts='';
+    data.teachers.forEach(function(x){ opts+='<option value="'+x.id+'"'+(x.id===e.teacherId?' selected':'')+'>'+esc(x.name)+'（'+esc(x.subject)+'）</option>'; });
+    teacherHtml='<div class="form-item"><label>课程名称 *</label><input id="f-ed-course" value="'+esc(e.course)+'"></div>'+
+    '<div class="form-item"><label>授课老师</label><select id="f-ed-teacher" onchange="renderFeeRuleSel(\'f-ed-rule\', this.value)">'+opts+'</select>'+
+    '<div class="hint">换老师只影响之后的耗课计费，已上课记录保持不变</div></div>'+
+    '<div class="form-item"><label>计费规则</label><select id="f-ed-rule"></select></div>';
+  }
+  openModal('✏️ 修改报名',
+  '<div class="hint" style="margin-bottom:10px;">学员：'+esc(st.name)+' · 剩 '+enrollStat(e).remain+' / '+enrollStat(e).total+' 节</div>'+
+  teacherHtml+
+  '<div class="form-inline">'+
+    '<div class="form-item"><label>报名类型</label><select id="f-ed-type"><option value="新签"'+(e.enrollType!=='续费'?' selected':'')+'>新签</option><option value="续费"'+(e.enrollType==='续费'?' selected':'')+'>续费</option></select></div>'+
+    '<div class="form-item"><label>报名日期</label><input id="f-ed-date" type="date" value="'+esc(e.enrollDate||todayStr())+'"></div>'+
+  '</div>'+
+  '<div class="form-item"><label>总学费（元）*</label><input id="f-ed-fee" type="number" min="0" step="0.01" value="'+(Number(e.totalFee)||0)+'"></div>'+
+  '<div class="card" style="background:var(--gray-light);box-shadow:none;margin-bottom:12px;">'+
+  '<div style="font-size:13px;font-weight:600;margin-bottom:8px;">📅 上课日期（点 ✕ 删除未上课的课次）</div>'+
+  '<div class="form-inline">'+
+    '<div class="form-item" style="flex:2;"><label>补一节课</label><input id="f-ed-1date" type="date"></div>'+
+    '<div class="form-item" style="flex:1;"><label>&nbsp;</label><button class="btn ghost block" style="height:42px;" onclick="addEdDate()">＋ 添加</button></div>'+
+  '</div>'+
+  '<div class="hint">已上课（已耗课）的课次不能在这里删；如需撤销某节已上课，先到课表里「标请假」再来删</div>'+
+  '</div>'+
+  '<div class="chips" id="ed-sess-chips"></div>'+
+  '<button class="btn block" onclick="saveEnrollEdit(\''+stuId+'\',\''+enrollId+'\')">保存修改</button>');
+  if(!e.classId) renderFeeRuleSel('f-ed-rule', e.teacherId, e.feeRuleId);
+  renderEdChips();
+}
+function renderEdChips(){
+  var el=document.getElementById('ed-sess-chips'); if(!el) return;
+  var h='';
+  tmpSess.forEach(function(s,i){
+    var tag = s.status==='attended' ? '<span class="badge green">已耗</span>' : (s.status==='absent' ? '<span class="badge orange">请假</span>' : '');
+    var x = s.status==='attended' ? '' : '<span class="x" onclick="delEdDate('+i+')">✕</span>';
+    h+='<span class="chip">'+s.date+tag+x+'</span>';
+  });
+  el.innerHTML = h || '<div class="hint">（已无课次，保存将只更新报名信息）</div>';
+}
+function addEdDate(){
+  var v=document.getElementById('f-ed-1date').value;
+  if(!v){ alert('请选择日期'); return; }
+  var dup=false; tmpSess.forEach(function(s){ if(s.date===v) dup=true; });
+  if(dup){ alert('该日期已存在'); return; }
+  tmpSess.push({date:v, status:'pending', lessonId:null});
+  tmpSess.sort(function(a,b){ return a.date<b.date?-1:1; });
+  renderEdChips();
+}
+function delEdDate(i){ if(tmpSess[i] && tmpSess[i].status==='attended'){ alert('已上课（已耗课）的课次不能删除，请先在课表中「标请假」'); return; } tmpSess.splice(i,1); renderEdChips(); }
+function saveEnrollEdit(stuId, enrollId){
+  var st=getStudent(stuId); if(!st) return;
+  var e=null; st.enrollments.forEach(function(x){ if(x.id===enrollId) e=x; });
+  if(!e) return;
+  var etype=document.getElementById('f-ed-type').value;
+  var edate=document.getElementById('f-ed-date').value||todayStr();
+  var fee=parseFloat(document.getElementById('f-ed-fee').value);
+  if(isNaN(fee)||fee<0){ alert('请填写正确的学费金额'); return; }
+  var oldSummary = e.course+'·'+money(e.totalFee)+'·'+(e.enrollType||'新签');
+  if(!e.classId){
+    e.course=document.getElementById('f-ed-course').value.trim()||e.course;
+    e.teacherId=document.getElementById('f-ed-teacher').value;
+    e.feeRuleId=document.getElementById('f-ed-rule').value||null;
+  }
+  e.enrollType=etype; e.enrollDate=edate; e.totalFee=fee;
+  e.sessions = tmpSess.map(function(s){ return {date:s.date, status:s.status, lessonId:s.lessonId}; });
+  e.totalHours = e.sessions.length;
+  addLog('修改报名', st.name+'「'+e.course+'」由 '+oldSummary+' 改为 '+e.course+'·'+money(fee)+'·'+etype+'；课次 '+e.totalHours+' 节（报名日期 '+edate+'）');
+  saveData(); closeModal();
+  autoConsume();
+  showStudentDetail(stuId);
+}
+function delEnroll(stuId, enrollId){
+  var st=getStudent(stuId); if(!st) return;
+  var e=null; st.enrollments.forEach(function(x){ if(x.id===enrollId) e=x; });
+  if(!e) return;
+  var es=enrollStat(e);
+  var attendedN=es.used;
+  var t=getTeacher(e.teacherId);
+  var msg='确认删除这条报名？\n\n'+st.name+' · '+e.course+'（'+(t?t.name:'')+'）\n总学费 '+money(e.totalFee)+' · 已耗课 '+attendedN+' 节 / 共 '+es.total+' 节';
+  if(attendedN>0) msg+='\n\n⚠️ 其中 '+attendedN+' 节已核算课时费，删除后将一并撤销这些课时费记录';
+  if(!confirm(msg)) return;
+  /* 撤销该报名关联的所有课时费（扫描全部课次记录，含已不在课表中的历史引用） */
+  data.lessons.slice().forEach(function(lesson){
+    var before = lesson.items.length;
+    lesson.items = lesson.items.filter(function(it){ return !(it.studentId===stuId && it.enrollId===enrollId); });
+    if(lesson.items.length===before) return;
+    var rule = lesson.ruleSnapshot || (getTeacher(lesson.teacherId)||{}).rule || null;
+    lesson.count = lesson.items.length;
+    if(lesson.count===0){
+      data.lessons = data.lessons.filter(function(l){ return l.id!==lesson.id; });
+      addLog('删除报名（撤销整节课）', lesson.date+' 因学员全部移除，课时费 '+money(lesson.fee)+' 已撤销');
+    }else{
+      var oldFee=lesson.fee;
+      lesson.fee = rule ? calcFee(rule, lesson.count) : 0;
+      addLog('删除报名（重算课费）', lesson.date+' 人数变为 '+lesson.count+' 人，课时费 '+money(oldFee)+'→'+money(lesson.fee));
+    }
+  });
+  st.enrollments = st.enrollments.filter(function(x){ return x.id!==enrollId; });
+  addLog('删除报名', st.name+'「'+e.course+'」整条报名已删除（学费 '+money(e.totalFee)+'）');
+  saveData();
   showStudentDetail(stuId);
 }
 
