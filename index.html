@@ -1675,7 +1675,8 @@ function changePass(){
   alert('密码已修改并加密上传云端\n\n请牢记新密码，并在其他设备用新密码登录。');
 }
 function exportData(){
-  var blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  /* 前置 \uFEFF BOM：让 WPS/Excel 正确识别 UTF-8，避免中文乱码 */
+  var blob=new Blob(['\uFEFF'+JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'});
   var a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
   a.download='教培课时薪酬数据备份_'+todayStr()+'.json';
@@ -1686,7 +1687,8 @@ function importData(input){
   var reader=new FileReader();
   reader.onload=function(){
     try{
-      var d=JSON.parse(reader.result);
+      var txt=String(reader.result).replace(/^\uFEFF/,''); /* 兼容带BOM的备份文件 */
+      var d=JSON.parse(txt);
       if(!d.admin||!d.students){ alert('文件格式不正确'); return; }
       if(!confirm('导入将覆盖当前全部数据，确定继续吗？')) return;
       data=d; saveData();
