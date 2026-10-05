@@ -693,9 +693,19 @@ var ADMIN_TABS = [
   {id:'logs',      ico:'📝', label:'日志'},
   {id:'settings',  ico:'⚙️', label:'设置'}
 ];
+function syncWarningBanner(){
+  if(session.role!=='admin') return '';
+  var warns=[];
+  if(!getWriteToken()) warns.push('本机未配置云端同步令牌：数据只保存在本机，换设备或清缓存会丢失！请到「设置→云端同步令牌」粘贴令牌');
+  if(cloud.status.indexOf('失败')>=0) warns.push('上次上传云端失败，数据仍保存在本机，会自动重试');
+  else if(cloud.pendingPush) warns.push('有数据待上传云端，正在自动同步…');
+  if(!warns.length) return '';
+  return '<div style="background:#fff3cd;border:1px solid #f0c36d;color:#8a6d3b;border-radius:10px;padding:10px 14px;margin:10px 0;font-size:13px;line-height:1.6;">⚠️ '+warns.join('<br>⚠️ ')+'</div>';
+}
 function renderAdmin(){
   var tab = currentView.name==='studentDetail' ? 'students' : currentView.name;
-  var h = '<div class="page '+(tab==='dashboard'?'active':'')+'" id="pg-dashboard"></div>'+
+  var h = syncWarningBanner()+
+          '<div class="page '+(tab==='dashboard'?'active':'')+'" id="pg-dashboard"></div>'+
           '<div class="page '+(tab==='students'?'active':'')+'" id="pg-students"></div>'+
           '<div class="page '+(tab==='teachers'?'active':'')+'" id="pg-teachers"></div>'+
           '<div class="page '+(tab==='report'?'active':'')+'" id="pg-report"></div>'+
@@ -1662,13 +1672,26 @@ function boot(){
   cloudFetchWithCache().then(function(blob){
     cloud.blob = blob;
     if(!blob || !blob.accounts || !blob.accounts.admin){ renderInit(); return; }
-    cloud.status = '已连接云端';
+    /* 本机缓存 vs 云端版本比对：防止本机未上传的新数据被云端旧数据覆盖（2026-10-05 防丢失保护） */
+    try{
+      var cachedStr = localStorage.getItem('peixiao_cloud_cache');
+      if(cachedStr && blob.ver){
+        var cached = JSON.parse(cachedStr);
+        if(cached && cached.ver && cached.ver > blob.ver && cached.accounts && cached.accounts.admin){
+          var useLocal = confirm('⚠️ 检测到本机有未上传到云端的新数据！\n\n本机最后修改：'+cached.ver+'\n云端版本：'+blob.ver+'\n\n【确定】使用本机较新数据（推荐，登录后请尽快到「设置」配置同步令牌并上传）\n【取消】使用云端数据（本机未上传的修改将被丢弃）');
+          if(useLocal){ cloud.blob = cached; cloud.pendingPush = true; cloud.status='已恢复本机较新数据（尚未上传云端）'; }
+        }
+      }
+    }catch(e){ console.error('版本比对失败', e); }
+    if(cloud.status!=='已恢复本机较新数据（尚未上传云端）') cloud.status = '已连接云端';
     renderLogin();
   }).catch(function(e){
     renderInit();
   });
 }
 boot();
+/* 每60秒自动重试未成功的上传，防止数据滞留本机 */
+setInterval(function(){ if(cloud.pendingPush){ try{ cloudPush(true); }catch(e){} } }, 60000);
 </script>
 </body>
 </html>
