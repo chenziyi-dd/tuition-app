@@ -297,9 +297,9 @@ function cloudPush(silent){
         content: btoa(unescape(encodeURIComponent(JSON.stringify(payload))))
       };
       if(info && info.sha) body.sha = info.sha;
+      /* 注意：不能用 keepalive:true —— keepalive 请求体上限 64KB，数据量大了会被浏览器静默拒绝 */
       return fetch(CLOUD_CFG.apiData, {
         method:'PUT',
-        keepalive:true,
         headers:{'Authorization':'token '+token, 'Content-Type':'application/json'},
         body: JSON.stringify(body)
       });
