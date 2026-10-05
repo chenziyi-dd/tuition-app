@@ -188,7 +188,7 @@ var CRYPTO = {
 };
 
 /* ---------- 云同步状态 ---------- */
-var cloud = { blob:null, status:'未同步', pendingPush:false, masterKey:null, wrapCache:{}, lastSync:'', lastPulledVer:'', lastPushError:'' };
+var cloud = { blob:null, status:'未同步', pendingPush:false, pushing:false, masterKey:null, wrapCache:{}, lastSync:'', lastPulledVer:'', lastPushError:'' };
 function cloudFetchOne(url){
   return fetch(url + (url.indexOf('?')<0?'?t=':'&t=') + Date.now(), {cache:'no-store'}).then(function(r){
     if(!r.ok) throw new Error('HTTP '+r.status);
@@ -266,8 +266,37 @@ function manualSave(){
     setTimeout(function(){ cloudPush(false); }, 300); /* 稍等加密状态落定，弹出上传结果 */
   });
 }
+/* 云端与本机数据自动合并：各集合按 id 取并集（同 id 以本机为准），补齐云端独有的记录，日志去重合并 */
+function mergeCloudData(remote){
+  if(!remote || !remote.students) return;
+  function byIdMap(arr){ var m={}; (arr||[]).forEach(function(x){ if(x && x.id) m[x.id]=x; }); return m; }
+  ['teachers','classes','lessons'].forEach(function(key){
+    var mine = byIdMap(data[key]);
+    (remote[key]||[]).forEach(function(x){
+      if(x && x.id && !mine[x.id]){ (data[key]=data[key]||[]).push(x); mine[x.id]=x; }
+    });
+  });
+  var myStu = byIdMap(data.students);
+  (remote.students||[]).forEach(function(s){
+    if(!s || !s.id) return;
+    if(!myStu[s.id]){ data.students.push(s); myStu[s.id]=s; return; }
+    var mine = myStu[s.id];
+    var myEnr = byIdMap(mine.enrollments);
+    (s.enrollments||[]).forEach(function(e){
+      if(e && e.id && !myEnr[e.id]){ (mine.enrollments=mine.enrollments||[]).push(e); myEnr[e.id]=e; }
+    });
+    if(!mine.pass && s.pass) mine.pass=s.pass;
+    if(!mine.phone && s.phone) mine.phone=s.phone;
+  });
+  var seen={}, logs=[];
+  (remote.logs||[]).forEach(function(l){ var k=(l.time||'')+'|'+(l.type||'')+'|'+(l.text||''); if(!seen[k]){ seen[k]=1; logs.push(l); } });
+  (data.logs||[]).forEach(function(l){ var k=(l.time||'')+'|'+(l.type||'')+'|'+(l.text||''); if(!seen[k]){ seen[k]=1; logs.push(l); } });
+  data.logs = logs;
+  if(remote.updatedAt && (!data.updatedAt || remote.updatedAt>data.updatedAt)) data.updatedAt=remote.updatedAt;
+}
 function cloudPush(silent){
   if(!cloud.pendingPush && !silent) { if(session.role==='admin') renderCloudStatus(); return; }
+  if(cloud.pushing){ return; } /* 防止并发上传互相踩（409） */
   var token = getWriteToken();
   if(!token){
     cloud.status='⚠️ 未配置同步令牌：数据已加密保存在本机，请到「设置→云端同步令牌」粘贴令牌后点击「立即上传」';
@@ -278,30 +307,50 @@ function cloudPush(silent){
   cloud.status='正在上传…';
   var payload = cloud.blob;
   if(!payload){ cloud.status='无待上传数据'; return; }
+  cloud.pushing = true;
+  function doPut(body){
+    /* 注意：不能用 keepalive:true —— keepalive 请求体上限 64KB，数据量大了会被浏览器静默拒绝 */
+    return fetch(CLOUD_CFG.apiData, {
+      method:'PUT',
+      headers:{'Authorization':'token '+token, 'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+  }
   fetch(CLOUD_CFG.apiData, {headers:{'Authorization':'token '+token}})
     .then(function(r){ return r.json(); })
     .then(function(info){
-      /* 多设备覆盖保护：若云端版本比本机已知的新（其他设备刚上传过），暂停上传防止旧数据覆盖新数据 */
-      try{
-        var remote = info && info.content ? JSON.parse(decodeURIComponent(escape(atob(info.content)))) : null;
-        if(remote && remote.ver && cloud.lastPulledVer && remote.ver > cloud.lastPulledVer){
-          var stop = {paused:true};
-          cloud.status='⏸️ 已暂停上传：云端有其他设备的新改动，为避免互相覆盖请刷新页面后继续';
-          if(!silent) alert('⚠️ 云端刚刚被其他设备更新过！\n\n为避免旧数据覆盖新数据，本次上传已暂停。\n\n你的修改已加密保存在本机，请【刷新页面】后再继续操作。');
-          if(session.role==='admin') renderCloudStatus();
-          throw stop;
-        }
-      }catch(pe){ if(pe && pe.paused) throw pe; }
-      var body = {
-        message: '同步 '+payload.ver,
-        content: btoa(unescape(encodeURIComponent(JSON.stringify(payload))))
-      };
-      if(info && info.sha) body.sha = info.sha;
-      /* 注意：不能用 keepalive:true —— keepalive 请求体上限 64KB，数据量大了会被浏览器静默拒绝 */
-      return fetch(CLOUD_CFG.apiData, {
-        method:'PUT',
-        headers:{'Authorization':'token '+token, 'Content-Type':'application/json'},
-        body: JSON.stringify(body)
+      var remote = null;
+      try{ remote = info && info.content ? JSON.parse(decodeURIComponent(escape(atob(info.content)))) : null; }catch(e){}
+      var remoteNewer = remote && remote.ver && cloud.lastPulledVer && remote.ver > cloud.lastPulledVer;
+      if(!remoteNewer){
+        var body = {
+          message: '同步 '+payload.ver,
+          content: btoa(unescape(encodeURIComponent(JSON.stringify(payload))))
+        };
+        if(info && info.sha) body.sha = info.sha;
+        return doPut(body);
+      }
+      /* 云端有其他设备的新改动 → 解密后与本机自动合并再上传，用户无需刷新页面 */
+      return CRYPTO.decryptJson(remote, cloud.masterKey).then(function(remoteData){
+        mergeCloudData(remoteData);
+        cloud.lastPulledVer = remote.ver;
+        data.logs.unshift({time:nowStr(), type:'数据合并', text:'检测到其他设备的改动（'+remote.ver+'），已自动合并云端与本机数据'});
+        return buildAccounts().then(function(accounts){
+          return CRYPTO.encryptJson(data, cloud.masterKey).then(function(enc){
+            payload = {v:1, ver:nowStr(), dataIv:enc.iv, data:enc.data, accounts:accounts};
+            cloud.blob = payload;
+            try{ localStorage.setItem('peixiao_cloud_cache', JSON.stringify(payload)); }catch(e){}
+            var body = { message:'同步(自动合并) '+payload.ver, content: btoa(unescape(encodeURIComponent(JSON.stringify(payload)))) };
+            if(info && info.sha) body.sha = info.sha;
+            return doPut(body);
+          });
+        });
+      }).catch(function(me){
+        /* 自动合并失败（如云端数据异常）→ 退回保护模式：暂停上传 */
+        cloud.status='⏸️ 已暂停上传：云端改动无法自动合并，请刷新页面';
+        if(!silent) alert('⚠️ 云端有其他设备的更新，自动合并失败：'+me.message+'\n\n你的数据已加密保存在本机，请刷新页面后再试。');
+        if(session.role==='admin') renderCloudStatus();
+        throw {paused:true};
       });
     })
     .then(function(r){
@@ -313,9 +362,11 @@ function cloudPush(silent){
       cloud.lastPulledVer = payload.ver; /* 记住云端当前版本，用于多设备覆盖检测 */
       if(session.role==='admin') renderCloudStatus();
       if(!silent) alert('✅ 已上传云端：'+ (res.commit? res.commit.sha.slice(0,7):''));
+      cloud.pushing = false;
     })
     .catch(function(e){
-      if(e && e.paused) return; /* 主动暂停，不算失败，不重试覆盖 */
+      cloud.pushing = false;
+      if(e && e.paused) return; /* 主动暂停（合并失败保护），不算失败 */
       cloud.status='上传失败（已保留在本机，稍后自动重试）';
       cloud.lastPushError=e.message;
       if(!silent) alert('上传云端失败：'+e.message+'\n数据已加密保存在本机，下次保存时会自动重试。');
