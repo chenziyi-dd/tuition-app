@@ -409,14 +409,15 @@ function teacherPaid(tid){
 /* ---------- 月度报名统计（新签/续费，仅管理员可见） ----------
    ym 格式 'YYYY-MM'，按 enrollDate 归集 */
 function monthlyStat(ym){
-  var res = {newSum:0, renewSum:0, totalFee:0, newCount:0, renewCount:0, records:[]};
+  var res = {newSum:0, renewSum:0, tuoguanSum:0, tuoguanCount:0, totalFee:0, newCount:0, renewCount:0, records:[]};
   data.students.forEach(function(st){
     st.enrollments.forEach(function(e){
       var d = e.enrollDate || (e.createdAt||'').slice(0,10);
       if(d.slice(0,7) === ym){
         var fee = Number(e.totalFee)||0;
         res.totalFee += fee;
-        if(e.enrollType==='续费'){ res.renewSum += fee; res.renewCount++; }
+        if(e.enrollType==='托管'){ res.tuoguanSum += fee; res.tuoguanCount++; }
+        else if(e.enrollType==='续费'){ res.renewSum += fee; res.renewCount++; }
         else { res.newSum += fee; res.newCount++; }
         var t = getTeacher(e.teacherId);
         res.records.push({student:st.name, course:e.course, type:e.enrollType||'新签', fee:fee, date:d, teacher:t?t.name:'-', stat:enrollStat(e)});
@@ -770,6 +771,7 @@ function showDashboard(){
     '<div class="stat"><div class="k">在读学员 / 老师</div><div class="v">'+data.students.length+' / '+data.teachers.length+'</div></div>'+
     '<div class="stat"><div class="k">本月新签（'+ms.newCount+'笔）</div><div class="v blue">'+money(ms.newSum)+'</div></div>'+
     '<div class="stat"><div class="k">本月续费（'+ms.renewCount+'笔）</div><div class="v green">'+money(ms.renewSum)+'</div></div>'+
+    '<div class="stat"><div class="k">本月托管（'+ms.tuoguanCount+'笔）</div><div class="v" style="color:#e67e22;">'+money(ms.tuoguanSum)+'</div></div>'+
   '</div>'+
   '<div class="card"><h3>✅ 今日已自动耗课 <span class="badge blue">'+todayLessons.length+' 节</span></h3>';
   if(!todayLessons.length) h+='<div class="empty">今天没有到期的课次（或已全部标记请假）</div>';
@@ -847,8 +849,9 @@ function showStudentDetail(stuId){
     var t=getTeacher(e.teacherId);
     var es=enrollStat(e);
     var clsName = e.classId && getClass(e.classId) ? ' · 班级：'+esc(getClass(e.classId).name) : '';
-    h+='<div class="card"><h3>'+esc(e.course)+' <span class="badge '+(e.enrollType==='续费'?'green':'blue')+'">'+esc(e.enrollType||'新签')+'</span> <span class="badge blue">剩 '+es.remain+' / '+es.total+' 节</span></h3>'+
-    '<div class="desc" style="font-size:12px;color:var(--text2);margin-bottom:6px;">授课老师：'+esc(t?t.name:'已删除')+'（'+esc(t?t.subject:'')+'） · 总学费：'+money(e.totalFee)+' · 报名日期：'+esc(e.enrollDate||'-')+clsName+'</div>'+
+    var tgName = e.enrollType==='托管' ? ' · 托管月：'+esc(e.feeMonth||'-') : '';
+    h+='<div class="card"><h3>'+esc(e.course)+' <span class="badge '+(e.enrollType==='续费'?'green':(e.enrollType==='托管'?'orange':'blue'))+'">'+esc(e.enrollType||'新签')+'</span> <span class="badge blue">剩 '+es.remain+' / '+es.total+' 节</span></h3>'+
+    '<div class="desc" style="font-size:12px;color:var(--text2);margin-bottom:6px;">授课老师：'+esc(t?t.name:'已删除')+'（'+esc(t?t.subject:'')+'） · '+(e.enrollType==='托管'?'当月托管费：':'总学费：')+money(e.totalFee)+' · 报名日期：'+esc(e.enrollDate||'-')+tgName+clsName+'</div>'+
     '<div style="display:flex;gap:8px;margin-bottom:8px;">'+
     '<button class="btn sm" onclick="openEditEnrollForm(\''+stuId+'\',\''+e.id+'\')">✏️ 修改报名</button>'+
     '<button class="btn sm danger" onclick="delEnroll(\''+stuId+'\',\''+e.id+'\')">🗑️ 删除报名</button>'+
@@ -926,14 +929,21 @@ function openEnrollForm(stuId){
   '<div class="hint">选用该老师的哪条课时费规则（小班/一对一/年级费率）</div></div>'+
   '<div class="form-item"><label>课程名称 *</label><input id="f-en-course" placeholder="如：初三英语精读班 / 数学一对一"></div>'+
   '<div class="form-inline">'+
-    '<div class="form-item"><label>报名类型 *</label><select id="f-en-type"><option value="新签">新签</option><option value="续费">续费</option></select>'+
-    '<div class="hint">仅管理员后台可见，用于月度新签/续费统计</div></div>'+
+    '<div class="form-item"><label>报名类型 *</label><select id="f-en-type" onchange="onEnTypeChange()"><option value="新签">新签</option><option value="续费">续费</option><option value="托管">托管（按月）</option></select>'+
+    '<div class="hint">托管=每天晚上1小时，按月缴费，老师按晚计课时费</div></div>'+
     '<div class="form-item"><label>报名日期</label><input id="f-en-date" type="date" value="'+todayStr()+'">'+
     '<div class="hint">补录历史报名时选实际缴费日期</div></div>'+
   '</div>'+
+  '<div id="tuoguan-box" style="display:none;">'+
+  '<div class="form-inline">'+
+    '<div class="form-item"><label>托管月份 *</label><input id="f-en-month" type="month" value="'+todayStr().slice(0,7)+'">'+
+    '<div class="hint">生成该月周一至周五的托管日期</div></div>'+
+    '<div class="form-item"><label>&nbsp;</label><button class="btn ghost block" style="height:42px;" onclick="genTuoGuanDates()">生成托管日期</button></div>'+
+  '</div>'+
+  '</div>'+
   '<div class="form-inline">'+
     '<div class="form-item"><label>总课时数（节）*</label><input id="f-en-hours" type="number" min="1" placeholder="如 20"></div>'+
-    '<div class="form-item"><label>总学费（元）*</label><input id="f-en-fee" type="number" min="0" placeholder="如 6000"></div>'+
+    '<div class="form-item"><label><span id="f-en-fee-label">总学费（元）*</span></label><input id="f-en-fee" type="number" min="0" placeholder="如 6000"></div>'+
   '</div>'+
   '<div class="card" style="background:var(--gray-light);box-shadow:none;margin-bottom:12px;">'+
   '<div style="font-size:13px;font-weight:600;margin-bottom:8px;">📅 上课日期（逐节录入）</div>'+
@@ -951,7 +961,7 @@ function openEnrollForm(stuId){
   '</div>'+
   '<div id="class-fee-box" style="display:none;">'+
   '<div class="form-inline">'+
-    '<div class="form-item"><label>报名类型 *</label><select id="f-en-type2"><option value="新签">新签</option><option value="续费">续费</option></select>'+
+    '<div class="form-item"><label>报名类型 *</label><select id="f-en-type2"><option value="新签">新签</option><option value="续费">续费</option><option value="托管">托管（按月）</option></select>'+
     '<div class="hint">仅管理员后台可见，用于月度统计</div></div>'+
     '<div class="form-item"><label>报名日期</label><input id="f-en-date2" type="date" value="'+todayStr()+'">'+
     '<div class="hint">补录历史报名时选实际缴费日期</div></div>'+
@@ -1005,6 +1015,33 @@ function genDates(){
   tmpDates.sort();
   renderChips();
 }
+/* 报名表单：报名类型切换（托管模式显隐） */
+function onEnTypeChange(){
+  var v=document.getElementById('f-en-type').value;
+  var box=document.getElementById('tuoguan-box');
+  var feeL=document.getElementById('f-en-fee-label');
+  if(box) box.style.display = (v==='托管')?'block':'none';
+  if(feeL) feeL.textContent = (v==='托管')?'当月托管费（元）*':'总学费（元）*';
+}
+/* 托管：生成所选月份周一至周五的全部日期 */
+function genTuoGuanDates(){
+  var m=document.getElementById('f-en-month').value;
+  if(!m){ alert('请选择托管月份'); return; }
+  var y=parseInt(m.slice(0,4)), mo=parseInt(m.slice(5,7));
+  tmpDates=[];
+  var d=new Date(y, mo-1, 1);
+  var guard=0;
+  while(d.getMonth()===mo-1 && guard<100){
+    var wd=d.getDay();
+    if(wd>=1 && wd<=5) tmpDates.push(d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()));
+    d.setDate(d.getDate()+1); guard++;
+  }
+  tmpDates.sort();
+  renderChips();
+  var hours=document.getElementById('f-en-hours');
+  if(hours) hours.value=tmpDates.length;
+  if(!tmpDates.length) alert('该月份没有工作日，请检查');
+}
 function addOneDate(){
   var v=document.getElementById('f-en-1date').value;
   if(!v){ alert('请选择日期'); return; }
@@ -1021,7 +1058,7 @@ function renderChips(){
 function saveEnrollment(stuId){
   var st=getStudent(stuId); if(!st) return;
   var cid=document.getElementById('f-en-class') ? document.getElementById('f-en-class').value : '';
-  var tid, course, etype, edate, fee, rid;
+  var tid, course, etype, edate, fee, rid, feeMonth=null;
   if(cid){
     /* 班级报名：老师/课程/课时/规则从班级带出 */
     var c=getClass(cid);
@@ -1038,6 +1075,11 @@ function saveEnrollment(stuId){
     etype=document.getElementById('f-en-type').value;
     edate=document.getElementById('f-en-date').value||todayStr();
     fee=parseFloat(document.getElementById('f-en-fee').value)||0;
+    if(etype==='托管'){
+      feeMonth=document.getElementById('f-en-month')? document.getElementById('f-en-month').value : '';
+      if(!feeMonth){ alert('托管报名请选择托管月份并生成托管日期'); return; }
+      if(course==='') course='晚间托管';
+    }
   }
   if(!course){ alert('请填写课程名称'); return; }
   if(!tmpDates.length){ alert('请生成或添加上课日期'); return; }
@@ -1045,13 +1087,14 @@ function saveEnrollment(stuId){
   st.enrollments.push({
     id:uid(), teacherId:tid, course:course,
     classId: cid||null, feeRuleId: rid||null,
-    enrollType:etype, enrollDate:edate,
+    enrollType:etype, enrollDate:edate, feeMonth:feeMonth||null,
     totalHours:tmpDates.length, totalFee:fee,
     createdAt:nowStr(), sessions:sessions
   });
   var t=getTeacher(tid);
   var cname=cid? '（班级：'+getClass(cid).name+'）':'';
-  addLog('报名缴费', st.name+'【'+etype+'】报名「'+course+'」'+cname+'（'+(t?t.name:'')+'）：共'+tmpDates.length+'节课，学费'+money(fee)+'（'+edate+'），已录入 '+tmpDates.length+' 个上课日期');
+  var tgTag=(etype==='托管'&&feeMonth)? '（托管月：'+feeMonth+'）':'';
+  addLog('报名缴费', st.name+'【'+etype+'】报名「'+course+'」'+cname+tgTag+'（'+(t?t.name:'')+'）：共'+tmpDates.length+'节课，学费'+money(fee)+'（'+edate+'），已录入 '+tmpDates.length+' 个上课日期'+(etype==='托管'?'（每天晚上1小时）':''));
   saveData(); closeModal();
   autoConsume();
   showStudentDetail(stuId);
@@ -1081,7 +1124,7 @@ function openEditEnrollForm(stuId, enrollId){
   '<div class="hint" style="margin-bottom:10px;">学员：'+esc(st.name)+' · 剩 '+enrollStat(e).remain+' / '+enrollStat(e).total+' 节</div>'+
   teacherHtml+
   '<div class="form-inline">'+
-    '<div class="form-item"><label>报名类型</label><select id="f-ed-type"><option value="新签"'+(e.enrollType!=='续费'?' selected':'')+'>新签</option><option value="续费"'+(e.enrollType==='续费'?' selected':'')+'>续费</option></select></div>'+
+    '<div class="form-item"><label>报名类型</label><select id="f-ed-type"><option value="新签"'+(e.enrollType!=='续费'&&e.enrollType!=='托管'?' selected':'')+'>新签</option><option value="续费"'+(e.enrollType==='续费'?' selected':'')+'>续费</option><option value="托管"'+(e.enrollType==='托管'?' selected':'')+'>托管（按月）</option></select></div>'+
     '<div class="form-item"><label>报名日期</label><input id="f-ed-date" type="date" value="'+esc(e.enrollDate||todayStr())+'"></div>'+
   '</div>'+
   '<div class="form-item"><label>总学费（元）*</label><input id="f-ed-fee" type="number" min="0" step="0.01" value="'+(Number(e.totalFee)||0)+'"></div>'+
@@ -1461,6 +1504,7 @@ function showReport(){
   '<div class="stat-grid">'+
     '<div class="stat"><div class="k">新签总额</div><div class="v blue">'+money(ms.newSum)+'</div><div class="k">'+ms.newCount+' 笔</div></div>'+
     '<div class="stat"><div class="k">续费总额</div><div class="v green">'+money(ms.renewSum)+'</div><div class="k">'+ms.renewCount+' 笔</div></div>'+
+    '<div class="stat"><div class="k">托管总额</div><div class="v" style="color:#e67e22;">'+money(ms.tuoguanSum)+'</div><div class="k">'+ms.tuoguanCount+' 笔</div></div>'+
     '<div class="stat"><div class="k">当月学费合计</div><div class="v">'+money(ms.totalFee)+'</div></div>'+
     '<div class="stat"><div class="k">当月耗课 / 课时费</div><div class="v" style="font-size:16px;">'+ms.consumed+' 节 / '+money(ms.feeOut)+'</div></div>'+
   '</div>'+
@@ -1469,7 +1513,7 @@ function showReport(){
   else{
     h+='<table class="tbl"><tr><th>报名日期</th><th>学员 / 课程</th><th>类型</th><th style="text-align:right;">学费</th></tr>';
     ms.records.forEach(function(r){
-      var tc = r.type==='续费'?'green':'blue';
+      var tc = r.type==='续费'?'green':(r.type==='托管'?'orange':'blue');
       h+='<tr><td>'+r.date.slice(5)+'</td><td><b>'+esc(r.student)+'</b><br><span style="font-size:12px;color:var(--text2);">'+esc(r.course)+' · '+esc(r.teacher)+'</span></td>'+
       '<td><span class="badge '+tc+'">'+r.type+'</span></td><td style="text-align:right;font-weight:600;">'+money(r.fee)+'</td></tr>';
     });
