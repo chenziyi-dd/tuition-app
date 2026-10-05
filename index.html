@@ -188,7 +188,7 @@ var CRYPTO = {
 };
 
 /* ---------- 云同步状态 ---------- */
-var cloud = { blob:null, status:'未同步', pendingPush:false, masterKey:null, wrapCache:{}, lastSync:'' };
+var cloud = { blob:null, status:'未同步', pendingPush:false, masterKey:null, wrapCache:{}, lastSync:'', lastPulledVer:'', lastPushError:'' };
 function cloudFetchOne(url){
   return fetch(url + (url.indexOf('?')<0?'?t=':'&t=') + Date.now(), {cache:'no-store'}).then(function(r){
     if(!r.ok) throw new Error('HTTP '+r.status);
@@ -281,6 +281,17 @@ function cloudPush(silent){
   fetch(CLOUD_CFG.apiData, {headers:{'Authorization':'token '+token}})
     .then(function(r){ return r.json(); })
     .then(function(info){
+      /* 多设备覆盖保护：若云端版本比本机已知的新（其他设备刚上传过），暂停上传防止旧数据覆盖新数据 */
+      try{
+        var remote = info && info.content ? JSON.parse(decodeURIComponent(escape(atob(info.content)))) : null;
+        if(remote && remote.ver && cloud.lastPulledVer && remote.ver > cloud.lastPulledVer){
+          var stop = {paused:true};
+          cloud.status='⏸️ 已暂停上传：云端有其他设备的新改动，为避免互相覆盖请刷新页面后继续';
+          if(!silent) alert('⚠️ 云端刚刚被其他设备更新过！\n\n为避免旧数据覆盖新数据，本次上传已暂停。\n\n你的修改已加密保存在本机，请【刷新页面】后再继续操作。');
+          if(session.role==='admin') renderCloudStatus();
+          throw stop;
+        }
+      }catch(pe){ if(pe && pe.paused) throw pe; }
       var body = {
         message: '同步 '+payload.ver,
         content: btoa(unescape(encodeURIComponent(JSON.stringify(payload))))
@@ -299,10 +310,12 @@ function cloudPush(silent){
     })
     .then(function(res){
       cloud.pendingPush=false; cloud.status='已同步'; cloud.lastSync=nowStr(); cloud.lastPushError='';
+      cloud.lastPulledVer = payload.ver; /* 记住云端当前版本，用于多设备覆盖检测 */
       if(session.role==='admin') renderCloudStatus();
       if(!silent) alert('✅ 已上传云端：'+ (res.commit? res.commit.sha.slice(0,7):''));
     })
     .catch(function(e){
+      if(e && e.paused) return; /* 主动暂停，不算失败，不重试覆盖 */
       cloud.status='上传失败（已保留在本机，稍后自动重试）';
       cloud.lastPushError=e.message;
       if(!silent) alert('上传云端失败：'+e.message+'\n数据已加密保存在本机，下次保存时会自动重试。');
@@ -1732,6 +1745,7 @@ function boot(){
   cloudFetchWithCache().then(function(blob){
     cloud.blob = blob;
     if(!blob || !blob.accounts || !blob.accounts.admin){ renderInit(); return; }
+    cloud.lastPulledVer = blob.ver; /* 记住云端当前版本，上传前检测其他设备是否更新过 */
     /* 本机缓存 vs 云端版本比对：防止本机未上传的新数据被云端旧数据覆盖（2026-10-05 防丢失保护） */
     try{
       var cachedStr = localStorage.getItem('peixiao_cloud_cache');
