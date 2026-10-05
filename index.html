@@ -238,7 +238,7 @@ function buildAccounts(){
 }
 /* 加密并缓存 → 防抖上传云端 */
 var pushTimer=null;
-function saveData(){
+function saveData(cb){
   data.updatedAt = nowStr();
   if(session.role!=='admin'){ return; } /* 家长端只读，不回写云端 */
   buildAccounts().then(function(accounts){
@@ -250,8 +250,21 @@ function saveData(){
       if(pushTimer) clearTimeout(pushTimer);
       cloud.status='已加密，待上传';
       pushTimer = setTimeout(function(){ cloudPush(true); }, 2500);
+      if(cb) cb();
     });
-  }).catch(function(e){ console.error('加密失败', e); cloud.status='加密失败：'+e.message; });
+  }).catch(function(e){ console.error('加密失败', e); cloud.status='加密失败：'+e.message; if(cb) cb(); });
+}
+/* 手动保存按钮：立即保存本机 + 上传云端，并弹出明确结果 */
+function manualSave(){
+  if(session.role!=='admin') return;
+  if(!getWriteToken()){
+    alert('⚠️ 本机未配置云端同步令牌，无法上传云端！\n\n请到「设置→云端同步令牌」粘贴令牌后，再回来点保存。\n（此前的数据已加密保存在本机，不会丢）');
+    return;
+  }
+  saveData(function(){
+    if(pushTimer) clearTimeout(pushTimer);
+    setTimeout(function(){ cloudPush(false); }, 300); /* 稍等加密状态落定，弹出上传结果 */
+  });
 }
 function cloudPush(silent){
   if(!cloud.pendingPush && !silent) { if(session.role==='admin') renderCloudStatus(); return; }
@@ -718,6 +731,8 @@ function renderAdmin(){
     h += '<div class="tab '+(tab===t.id?'active':'')+'" onclick="switchTab(\''+t.id+'\')"><span class="ico">'+t.ico+'</span>'+t.label+'</div>';
   });
   h += '</div>';
+  /* 悬浮手动保存按钮：随时点，弹窗告知保存/上传结果 */
+  h += '<button onclick="manualSave()" style="position:fixed;right:16px;bottom:calc(76px + env(safe-area-inset-bottom));z-index:900;width:60px;height:60px;border-radius:50%;border:none;background:#1a56db;color:#fff;font-size:12px;font-weight:600;box-shadow:0 4px 14px rgba(26,86,219,.45);display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.3;cursor:pointer;"><span style="font-size:20px;">☁️</span>保存</button>';
   document.getElementById('app').innerHTML = h;
   if(tab==='dashboard') showDashboard();
   else if(tab==='students'){ if(currentView.name==='studentDetail') showStudentDetail(currentView.studentId); else showStudents(); }
