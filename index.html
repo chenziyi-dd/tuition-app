@@ -270,7 +270,7 @@ function manualSave(){
 function mergeCloudData(remote){
   if(!remote || !remote.students) return;
   function byIdMap(arr){ var m={}; (arr||[]).forEach(function(x){ if(x && x.id) m[x.id]=x; }); return m; }
-  ['teachers','classes','lessons'].forEach(function(key){
+  ['teachers','classes','lessons','refunds','expenses'].forEach(function(key){
     var mine = byIdMap(data[key]);
     (remote[key]||[]).forEach(function(x){
       if(x && x.id && !mine[x.id]){ (data[key]=data[key]||[]).push(x); mine[x.id]=x; }
@@ -396,6 +396,8 @@ function defaultData(){
     classes:[],    // {id,name,teacherId,course,dates:['YYYY-MM-DD'],createdAt} 预设班级：固定老师+课程+上课日期
     students:[],   // {id,name,phone,pass,enrollments:[{id,teacherId,course,classId?,enrollType,enrollDate,totalHours,totalFee,createdAt,sessions:[{date,status,lessonId}]}]}
     lessons:[],    // {id,teacherId,date,count,fee,items:[{studentId,enrollId,studentName,course}],ruleSnapshot}
+    refunds:[],    // {id,studentId,enrollId,amount,date,reason,createdAt} 学员退费记录（退费金额从总收入扣除）
+    expenses:[],   // {id,category,amount,date,remark,createdAt} 其他成本支出（类目由用户自定义输入，系统不预置）
     logs:[]        // {time,type,text}
   };
 }
@@ -404,6 +406,8 @@ var data;
 function migrateData(){
   var changed = false;
   if(!Array.isArray(data.classes)){ data.classes = []; changed = true; }
+  if(!Array.isArray(data.refunds)){ data.refunds = []; changed = true; }
+  if(!Array.isArray(data.expenses)){ data.expenses = []; changed = true; }
   /* 旧版老师只有单一 rule → 迁移为规则列表（保留 t.rule 兼容显示） */
   data.teachers.forEach(function(t){
     if(!Array.isArray(t.rules) || !t.rules.length){
@@ -469,14 +473,35 @@ function studentStat(st){
   st.enrollments.forEach(function(e){ var s=enrollStat(e); t+=s.total; u+=s.used; a+=s.absent; });
   return {total:t, used:u, absent:a, remain:t-u};
 }
+/* ---------- 退费统计（按报名课程维度） ---------- */
+function enrollRefundList(stuId, enrollId){
+  return (data.refunds||[]).filter(function(r){ return r.studentId===stuId && r.enrollId===enrollId; })
+    .sort(function(a,b){ return a.date<b.date?1:(a.date>b.date?-1:0); });
+}
+function enrollRefundTotal(stuId, enrollId){
+  var sum=0; enrollRefundList(stuId, enrollId).forEach(function(r){ sum += Number(r.amount)||0; });
+  return sum;
+}
+/* ---------- 其他成本支出：类目取自历史录入（不预置任何类目） ---------- */
+function expenseCategories(){
+  var seen={}, list=[];
+  (data.expenses||[]).forEach(function(x){ if(x.category && !seen[x.category]){ seen[x.category]=1; list.push(x.category); } });
+  return list;
+}
+function expenseTotal(){ var s=0; (data.expenses||[]).forEach(function(x){ s += Number(x.amount)||0; }); return s; }
 
-/* ---------- 全局财务汇总 ---------- */
+/* ---------- 全局财务汇总 ----------
+   余额 = 总学费收入 − 学员退费 − 累计老师课时费 − 其他成本支出 */
 function financeSummary(){
   var feeIn=0;
   data.students.forEach(function(st){ st.enrollments.forEach(function(e){ feeIn += Number(e.totalFee)||0; }); });
   var feeOut=0, consumed=0;
   data.lessons.forEach(function(l){ feeOut += Number(l.fee)||0; consumed += l.items.length; });
-  return { feeIn:feeIn, feeOut:feeOut, consumed:consumed, balance:feeIn-feeOut };
+  var refund=0;
+  (data.refunds||[]).forEach(function(r){ refund += Number(r.amount)||0; });
+  var otherCost=0;
+  (data.expenses||[]).forEach(function(x){ otherCost += Number(x.amount)||0; });
+  return { feeIn:feeIn, feeOut:feeOut, consumed:consumed, refund:refund, otherCost:otherCost, balance:feeIn-refund-feeOut-otherCost };
 }
 function teacherPaid(tid){
   var sum=0;
@@ -487,7 +512,8 @@ function teacherPaid(tid){
 /* ---------- 月度报名统计（新签/续费，仅管理员可见） ----------
    ym 格式 'YYYY-MM'，按 enrollDate 归集 */
 function monthlyStat(ym){
-  var res = {newSum:0, renewSum:0, tuoguanSum:0, tuoguanCount:0, totalFee:0, newCount:0, renewCount:0, records:[]};
+  var res = {newSum:0, renewSum:0, tuoguanSum:0, tuoguanCount:0, totalFee:0, newCount:0, renewCount:0, records:[],
+             refundSum:0, refundCount:0, refundRecords:[]};
   data.students.forEach(function(st){
     st.enrollments.forEach(function(e){
       var d = e.enrollDate || (e.createdAt||'').slice(0,10);
@@ -508,6 +534,18 @@ function monthlyStat(ym){
   data.lessons.forEach(function(l){
     if((l.date||'').slice(0,7)===ym){ res.consumed += l.items.length; res.feeOut += Number(l.fee)||0; }
   });
+  /* 当月退费总额（按退费日期归集） */
+  (data.refunds||[]).forEach(function(r){
+    var d = r.date || (r.createdAt||'').slice(0,10);
+    if(d.slice(0,7) !== ym) return;
+    var amt = Number(r.amount)||0;
+    res.refundSum += amt; res.refundCount++;
+    var st = getStudent(r.studentId), en = null;
+    if(st){ st.enrollments.forEach(function(x){ if(x.id===r.enrollId) en=x; }); }
+    res.refundRecords.push({student: st?st.name:'（学员已删除）', course: en?en.course:'-',
+      amount:amt, date:d, reason:r.reason||'', refundId:r.id, studentId:r.studentId});
+  });
+  res.refundRecords.sort(function(a,b){ return a.date<b.date?1:-1; });
   return res;
 }
 /* 所有出现过报名或耗课的月份列表（倒序） */
@@ -518,6 +556,7 @@ function allMonths(){
     if(d) set[d.slice(0,7)] = 1;
   });});
   data.lessons.forEach(function(l){ if(l.date) set[l.date.slice(0,7)]=1; });
+  (data.refunds||[]).forEach(function(r){ var d=r.date||(r.createdAt||'').slice(0,10); if(d) set[d.slice(0,7)]=1; });
   return Object.keys(set).sort().reverse();
 }
 
@@ -844,14 +883,17 @@ function showDashboard(){
   '<div class="topbar"><h1>📊 经营看板<button class="logout-btn" onclick="doLogout()">退出</button></h1>'+
   '<div class="sub">'+today+' · 打开系统即自动核算耗课</div></div>'+
   '<div class="stat-grid">'+
-    '<div class="stat big"><div class="k">机构当前剩余余额（总学费 − 累计课时费）</div><div class="v">'+money(f.balance)+'</div></div>'+
+    '<div class="stat big"><div class="k">机构当前剩余余额（总学费 − 退费 − 课时费 − 其他支出）</div><div class="v">'+money(f.balance)+'</div></div>'+
     '<div class="stat"><div class="k">总学费收入</div><div class="v blue">'+money(f.feeIn)+'</div></div>'+
+    '<div class="stat"><div class="k">累计退费</div><div class="v red">'+money(f.refund)+'</div></div>'+
     '<div class="stat"><div class="k">累计老师课时费</div><div class="v red">'+money(f.feeOut)+'</div></div>'+
+    '<div class="stat"><div class="k">累计其他成本支出</div><div class="v" style="color:#e67e22;">'+money(f.otherCost)+'</div></div>'+
     '<div class="stat"><div class="k">累计已耗课时</div><div class="v">'+f.consumed+' 节</div></div>'+
     '<div class="stat"><div class="k">在读学员 / 老师</div><div class="v">'+data.students.length+' / '+data.teachers.length+'</div></div>'+
     '<div class="stat"><div class="k">本月新签（'+ms.newCount+'笔）</div><div class="v blue">'+money(ms.newSum)+'</div></div>'+
     '<div class="stat"><div class="k">本月续费（'+ms.renewCount+'笔）</div><div class="v green">'+money(ms.renewSum)+'</div></div>'+
     '<div class="stat"><div class="k">本月托管（'+ms.tuoguanCount+'笔）</div><div class="v" style="color:#e67e22;">'+money(ms.tuoguanSum)+'</div></div>'+
+    '<div class="stat"><div class="k">本月退费（'+ms.refundCount+'笔）</div><div class="v red">'+money(ms.refundSum)+'</div></div>'+
   '</div>'+
   '<div class="card"><h3>✅ 今日已自动耗课 <span class="badge blue">'+todayLessons.length+' 节</span></h3>';
   if(!todayLessons.length) h+='<div class="empty">今天没有到期的课次（或已全部标记请假）</div>';
@@ -866,6 +908,21 @@ function showDashboard(){
   else upcoming.slice(0,12).forEach(function(u){
     h+='<div class="row"><div class="main"><div class="title">'+esc(u.student)+' · '+esc(u.course)+'</div><div class="desc">'+u.date+' '+esc(u.teacher)+'</div></div><span class="badge blue">待上课</span></div>';
   });
+  h+='</div>';
+  /* ---- 其他成本支出模块（类目自定义，录入即扣减机构余额） ---- */
+  var expList = (data.expenses||[]).slice().sort(function(a,b){ return a.date<b.date?1:(a.date>b.date?-1:0); });
+  h+='<div class="card"><h3>🧾 其他成本支出 <span class="badge orange">累计 '+money(f.otherCost)+'</span></h3>'+
+  '<div class="desc" style="font-size:12px;color:var(--text2);margin-bottom:8px;">课时费以外的各类成本（房租、水电、教材、推广等）。类目自行填写，保存后立即从机构余额中扣除。</div>'+
+  '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">'+
+  '<button class="btn sm" onclick="openExpenseForm()">＋ 记一笔支出</button>'+
+  '<button class="btn sm ghost" onclick="showExpenses()">📋 全部支出记录（'+expList.length+'）</button>'+
+  '</div>';
+  if(!expList.length) h+='<div class="empty" style="padding:14px 0;">还没有支出记录</div>';
+  else expList.slice(0,5).forEach(function(x){
+    h+='<div class="row"><div class="main"><div class="title">'+esc(x.category)+' <span class="badge gray">'+x.date+'</span></div>'+
+    (x.remark?'<div class="desc">'+esc(x.remark)+'</div>':'')+'</div><span class="badge red">-'+money(x.amount)+'</span></div>';
+  });
+  if(expList.length>5) h+='<div class="hint">仅显示最近 5 笔，点「全部支出记录」查看全部</div>';
   h+='</div>'+
   '<div class="card"><h3>⚡ 快捷操作</h3>'+
   '<div style="display:flex;gap:8px;flex-wrap:wrap;">'+
@@ -930,13 +987,27 @@ function showStudentDetail(stuId){
     var es=enrollStat(e);
     var clsName = e.classId && getClass(e.classId) ? ' · 班级：'+esc(getClass(e.classId).name) : '';
     var tgName = e.enrollType==='托管' ? ' · 托管月：'+esc(e.feeMonth||'-') : '';
-    h+='<div class="card"><h3>'+esc(e.course)+' <span class="badge '+(e.enrollType==='续费'?'green':(e.enrollType==='托管'?'orange':'blue'))+'">'+esc(e.enrollType||'新签')+'</span> <span class="badge blue">剩 '+es.remain+' / '+es.total+' 节</span></h3>'+
-    '<div class="desc" style="font-size:12px;color:var(--text2);margin-bottom:6px;">授课老师：'+esc(t?t.name:'已删除')+'（'+esc(t?t.subject:'')+'） · '+(e.enrollType==='托管'?'当月托管费：':'总学费：')+money(e.totalFee)+' · 报名日期：'+esc(e.enrollDate||'-')+tgName+clsName+'</div>'+
-    '<div style="display:flex;gap:8px;margin-bottom:8px;">'+
+    var refunded = enrollRefundTotal(stuId, e.id);
+    var rlist = enrollRefundList(stuId, e.id);
+    var refundLine = refunded>0 ? ' · <span style="color:var(--red);">已退费：'+money(refunded)+'（净缴 '+money((Number(e.totalFee)||0)-refunded)+'）</span>' : '';
+    h+='<div class="card"><h3>'+esc(e.course)+' <span class="badge '+(e.enrollType==='续费'?'green':(e.enrollType==='托管'?'orange':'blue'))+'">'+esc(e.enrollType||'新签')+'</span> <span class="badge blue">剩 '+es.remain+' / '+es.total+' 节</span>'+(refunded>0?' <span class="badge red">已退 '+money(refunded)+'</span>':'')+'</h3>'+
+    '<div class="desc" style="font-size:12px;color:var(--text2);margin-bottom:6px;">授课老师：'+esc(t?t.name:'已删除')+'（'+esc(t?t.subject:'')+'） · '+(e.enrollType==='托管'?'当月托管费：':'总学费：')+money(e.totalFee)+refundLine+' · 报名日期：'+esc(e.enrollDate||'-')+tgName+clsName+'</div>'+
+    '<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;">'+
     '<button class="btn sm" onclick="openEditEnrollForm(\''+stuId+'\',\''+e.id+'\')">✏️ 修改报名</button>'+
+    '<button class="btn sm warn" onclick="openRefundForm(\''+stuId+'\',\''+e.id+'\')">💸 退费</button>'+
     '<button class="btn sm danger" onclick="delEnroll(\''+stuId+'\',\''+e.id+'\')">🗑️ 删除报名</button>'+
-    '</div>'+
-    '<table class="tbl"><tr><th>上课日期</th><th>状态</th><th style="text-align:right;">操作</th></tr>';
+    '</div>';
+    if(rlist.length){
+      h+='<div style="background:var(--red-light);border-radius:10px;padding:8px 10px;margin-bottom:8px;">'+
+      '<div style="font-size:12px;font-weight:600;color:var(--red);margin-bottom:2px;">💸 退费记录（'+rlist.length+' 笔，合计 '+money(refunded)+'）</div>';
+      rlist.forEach(function(r){
+        h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;padding:2px 0;">'+
+        '<span>'+r.date+' · 退费 <b>'+money(r.amount)+'</b>'+(r.reason?' · '+esc(r.reason):'')+'</span>'+
+        '<span class="x" style="cursor:pointer;color:var(--red);font-weight:700;" onclick="delRefund(\''+r.id+'\',\''+stuId+'\')">✕</span></div>';
+      });
+      h+='</div>';
+    }
+    h+='<table class="tbl"><tr><th>上课日期</th><th>状态</th><th style="text-align:right;">操作</th></tr>';
     e.sessions.forEach(function(s,idx){
       var badge;
       if(s.status==='attended') badge='<span class="badge green">已上课·已耗课</span>';
@@ -1290,9 +1361,136 @@ function delEnroll(stuId, enrollId){
     }
   });
   st.enrollments = st.enrollments.filter(function(x){ return x.id!==enrollId; });
-  addLog('删除报名', st.name+'「'+e.course+'」整条报名已删除（学费 '+money(e.totalFee)+'）');
+  /* 同步清理该报名下的退费记录，避免退费悬挂在已删除的报名上继续扣减余额 */
+  var removedRefund=0;
+  (data.refunds||[]).slice().forEach(function(r){
+    if(r.studentId===stuId && r.enrollId===enrollId){
+      removedRefund += Number(r.amount)||0;
+      data.refunds = data.refunds.filter(function(x){ return x.id!==r.id; });
+    }
+  });
+  addLog('删除报名', st.name+'「'+e.course+'」整条报名已删除（学费 '+money(e.totalFee)+'）'+(removedRefund?'，同时撤销关联退费记录 '+money(removedRefund):''));
   saveData();
   showStudentDetail(stuId);
+}
+
+/* =========================================================
+   退费模块（2026-10-09 新增）
+   入口：学员详情页 → 对应报名课程的「💸 退费」按钮
+   规则：退费金额从机构总收入中扣除，机构余额实时减少；
+        按「退费日期」归入月度报表，汇总输出当月退费总额
+   ========================================================= */
+function openRefundForm(stuId, enrollId){
+  var st=getStudent(stuId); if(!st) return;
+  var e=null; st.enrollments.forEach(function(x){ if(x.id===enrollId) e=x; });
+  if(!e){ alert('未找到该报名记录'); return; }
+  var fee=Number(e.totalFee)||0;
+  var refunded=enrollRefundTotal(stuId, enrollId);
+  var canRefund=Math.max(0, fee-refunded);
+  openModal('💸 学员退费',
+  '<div class="warn-tip">退费将从机构总收入中扣除对应金额，机构剩余余额实时减少，并按退费日期计入月度报表的「当月退费总额」。课时数不受影响，如需同步调整课时请到「修改报名」处理。</div>'+
+  '<div class="card" style="background:var(--gray-light);box-shadow:none;margin-bottom:12px;">'+
+  '<div class="desc" style="font-size:13px;color:var(--text);">学员：<b>'+esc(st.name)+'</b> · 课程：<b>'+esc(e.course)+'</b></div>'+
+  '<div class="desc" style="font-size:12px;margin-top:4px;">总学费：'+money(fee)+' · 已退费：<span style="color:var(--red);">'+money(refunded)+'</span> · 可退上限：<b>'+money(canRefund)+'</b></div>'+
+  '</div>'+
+  '<div class="form-inline">'+
+    '<div class="form-item"><label>退费金额（元）*</label><input id="f-rf-amount" type="number" min="0" step="0.01" placeholder="如 1200"></div>'+
+    '<div class="form-item"><label>退费日期 *</label><input id="f-rf-date" type="date" value="'+todayStr()+'"></div>'+
+  '</div>'+
+  '<div class="form-item"><label>退费原因 / 备注</label><input id="f-rf-reason" placeholder="如：学员转学，退剩余课时费"></div>'+
+  '<button class="btn block" onclick="saveRefund(\''+stuId+'\',\''+enrollId+'\')">确认退费</button>');
+}
+function saveRefund(stuId, enrollId){
+  var st=getStudent(stuId); if(!st) return;
+  var e=null; st.enrollments.forEach(function(x){ if(x.id===enrollId) e=x; });
+  if(!e){ alert('未找到该报名记录'); return; }
+  var amt=parseFloat((document.getElementById('f-rf-amount')||{}).value);
+  if(isNaN(amt)||amt<=0){ alert('请填写正确的退费金额'); return; }
+  var date=(document.getElementById('f-rf-date')||{}).value||todayStr();
+  var reason=((document.getElementById('f-rf-reason')||{}).value||'').trim();
+  var fee=Number(e.totalFee)||0;
+  var refunded=enrollRefundTotal(stuId, enrollId);
+  if(refunded+amt > fee+0.001){
+    alert('退费金额超出可退上限！\n\n该报名总学费 '+money(fee)+'，已退费 '+money(refunded)+'，本次最多可退 '+money(Math.max(0,fee-refunded)));
+    return;
+  }
+  if(!confirm('确认退费 '+money(amt)+'？\n\n学员：'+st.name+'\n课程：'+e.course+'\n退费日期：'+date+'\n\n确认后将从机构总收入中扣除该金额。')) return;
+  data.refunds.push({id:uid(), studentId:stuId, enrollId:enrollId, amount:amt, date:date, reason:reason, createdAt:nowStr()});
+  addLog('学员退费', st.name+'「'+e.course+'」退费 '+money(amt)+'（'+date+'）'+(reason?'，原因：'+reason:'')+'，已从总收入中扣除');
+  saveData(); closeModal();
+  showStudentDetail(stuId);
+}
+function delRefund(refundId, stuId){
+  var r=null; (data.refunds||[]).forEach(function(x){ if(x.id===refundId) r=x; });
+  if(!r) return;
+  var st=getStudent(r.studentId);
+  if(!confirm('确认撤销这笔退费记录？\n\n'+(st?st.name:'')+' · 退费 '+money(r.amount)+'（'+r.date+'）\n\n撤销后该金额将重新计回机构余额。')) return;
+  data.refunds = data.refunds.filter(function(x){ return x.id!==refundId; });
+  addLog('撤销退费', (st?st.name:'')+' 退费 '+money(r.amount)+'（'+r.date+'）记录已撤销，金额已重新计回余额');
+  saveData();
+  if(stuId) showStudentDetail(stuId); else showDashboard();
+}
+
+/* =========================================================
+   其他成本支出模块（2026-10-09 新增）
+   录入课时费以外的各类成本；系统不预置任何类目，类目名称由用户自行输入
+   （历史类目仅作为输入提示，可直接选用或另填新类目）
+   每新增一笔支出，机构剩余余额实时扣减
+   ========================================================= */
+function openExpenseForm(){
+  var cats=expenseCategories();
+  var dl = cats.length ? '<datalist id="exp-cats">'+cats.map(function(c){ return '<option value="'+esc(c)+'"></option>'; }).join('')+'</datalist>' : '';
+  openModal('🧾 记一笔支出',
+  '<div class="warn-tip">用于录入老师课时费以外的成本（房租、水电、教材、推广、耗材等）。系统不预置类目，类目名称由你自己填写；保存后机构剩余余额立即扣减该笔金额。</div>'+
+  '<div class="form-item"><label>支出类目 *</label>'+
+  '<input id="f-ex-cat" list="exp-cats" placeholder="自行填写，如：房租 / 水电费 / 教材印刷 / 地推物料">'+dl+
+  '<div class="hint">'+(cats.length? '已用过的类目：'+cats.map(esc).join('、')+'（可直接选用，也可输入新类目）' : '首次录入，请自定义类目名称')+'</div></div>'+
+  '<div class="form-inline">'+
+    '<div class="form-item"><label>支出金额（元）*</label><input id="f-ex-amount" type="number" min="0" step="0.01" placeholder="如 3500"></div>'+
+    '<div class="form-item"><label>支出日期 *</label><input id="f-ex-date" type="date" value="'+todayStr()+'"></div>'+
+  '</div>'+
+  '<div class="form-item"><label>备注 / 说明</label><input id="f-ex-remark" placeholder="如：10月份房租"></div>'+
+  '<button class="btn block" onclick="saveExpense()">保存支出</button>');
+}
+function saveExpense(){
+  var cat=((document.getElementById('f-ex-cat')||{}).value||'').trim();
+  var amt=parseFloat((document.getElementById('f-ex-amount')||{}).value);
+  var date=(document.getElementById('f-ex-date')||{}).value||todayStr();
+  var remark=((document.getElementById('f-ex-remark')||{}).value||'').trim();
+  if(!cat){ alert('请填写支出类目名称'); return; }
+  if(isNaN(amt)||amt<=0){ alert('请填写正确的支出金额'); return; }
+  data.expenses.push({id:uid(), category:cat, amount:amt, date:date, remark:remark, createdAt:nowStr()});
+  addLog('成本支出', '【'+cat+'】支出 '+money(amt)+'（'+date+'）'+(remark?'，'+remark:'')+'，机构余额已扣减');
+  saveData(); closeModal();
+  showDashboard();
+}
+function showExpenses(){
+  var list=(data.expenses||[]).slice().sort(function(a,b){ return a.date<b.date?1:(a.date>b.date?-1:0); });
+  var h='<div class="card" style="background:var(--gray-light);box-shadow:none;margin-bottom:10px;">'+
+  '<div class="desc" style="font-size:13px;color:var(--text);">共 <b>'+list.length+'</b> 笔 · 累计支出 <b style="color:#e67e22;">'+money(expenseTotal())+'</b></div>'+
+  '<div class="hint">每笔支出均从机构剩余余额中扣除</div></div>'+
+  '<button class="btn block" style="margin-bottom:10px;" onclick="closeModal();openExpenseForm()">＋ 记一笔支出</button>';
+  if(!list.length) h+='<div class="empty">暂无支出记录</div>';
+  else{
+    h+='<div style="max-height:50vh;overflow-y:auto;">';
+    list.forEach(function(x){
+      h+='<div class="row"><div class="main"><div class="title">'+esc(x.category)+' <span class="badge gray">'+x.date+'</span></div>'+
+      (x.remark?'<div class="desc">'+esc(x.remark)+'</div>':'')+'</div>'+
+      '<span class="badge red" style="margin-right:6px;">-'+money(x.amount)+'</span>'+
+      '<button class="btn sm danger" onclick="delExpense(\''+x.id+'\')">删除</button></div>';
+    });
+    h+='</div>';
+  }
+  openModal('🧾 其他成本支出记录', h);
+}
+function delExpense(id){
+  var x=null; (data.expenses||[]).forEach(function(y){ if(y.id===id) x=y; });
+  if(!x) return;
+  if(!confirm('确认删除这笔支出？\n\n【'+x.category+'】'+money(x.amount)+'（'+x.date+'）\n\n删除后金额将重新计回机构余额。')) return;
+  data.expenses = data.expenses.filter(function(y){ return y.id!==id; });
+  addLog('删除支出', '【'+x.category+'】'+money(x.amount)+'（'+x.date+'）支出记录已删除，金额已计回余额');
+  saveData();
+  closeModal(); showExpenses(); showDashboard();
 }
 
 /* =========================================================
@@ -1586,6 +1784,7 @@ function showReport(){
     '<div class="stat"><div class="k">续费总额</div><div class="v green">'+money(ms.renewSum)+'</div><div class="k">'+ms.renewCount+' 笔</div></div>'+
     '<div class="stat"><div class="k">托管总额</div><div class="v" style="color:#e67e22;">'+money(ms.tuoguanSum)+'</div><div class="k">'+ms.tuoguanCount+' 笔</div></div>'+
     '<div class="stat"><div class="k">当月学费合计</div><div class="v">'+money(ms.totalFee)+'</div></div>'+
+    '<div class="stat"><div class="k">当月退费总额</div><div class="v red">'+money(ms.refundSum)+'</div><div class="k">'+ms.refundCount+' 笔</div></div>'+
     '<div class="stat"><div class="k">当月耗课 / 课时费</div><div class="v" style="font-size:16px;">'+ms.consumed+' 节 / '+money(ms.feeOut)+'</div></div>'+
   '</div>'+
   '<div class="card"><h3>📋 '+reportMonth+' 报名明细（'+ms.records.length+' 笔）</h3>';
@@ -1600,7 +1799,18 @@ function showReport(){
     h+='</table>';
   }
   h+='</div>'+
-  '<div class="empty" style="font-size:11px;">报名类型在「学员 → 报名新课程」中录入 · 该报表不对家长端开放</div>';
+  '<div class="card"><h3>💸 '+reportMonth+' 退费明细（'+ms.refundRecords.length+' 笔，合计 '+money(ms.refundSum)+'）</h3>';
+  if(!ms.refundRecords.length) h+='<div class="empty">本月无退费记录</div>';
+  else{
+    h+='<table class="tbl"><tr><th>退费日期</th><th>学员 / 课程</th><th style="text-align:right;">退费金额</th></tr>';
+    ms.refundRecords.forEach(function(r){
+      h+='<tr><td>'+esc(r.date.slice(5))+'</td><td><b>'+esc(r.student)+'</b><br><span style="font-size:12px;color:var(--text2);">'+esc(r.course)+(r.reason?' · '+esc(r.reason):'')+'</span></td>'+
+      '<td style="text-align:right;font-weight:600;color:var(--red);">-'+money(r.amount)+'</td></tr>';
+    });
+    h+='</table>';
+  }
+  h+='</div>'+
+  '<div class="empty" style="font-size:11px;">报名类型在「学员 → 报名新课程」中录入 · 退费在「学员 → 报名课程 → 💸 退费」中录入 · 该报表不对家长端开放</div>';
   el.innerHTML=h;
 }
 
@@ -1610,7 +1820,8 @@ function showReport(){
 function showLogs(){
   var el=document.getElementById('pg-logs'); if(!el) return;
   var h='<div class="topbar"><h1>📝 操作日志</h1><div class="sub">共 '+data.logs.length+' 条记录 · 耗课/请假/规则修改全程留痕</div></div>';
-  var typeColor={ '自动耗课':'green','请假标记':'orange','补请假':'orange','补请假（撤销整节课）':'orange','取消请假':'blue','报名缴费':'blue','新增学员':'blue','编辑学员':'gray','新增老师':'blue','规则修改':'red','登录':'gray','数据导入':'red','数据清空':'red' };
+  var typeColor={ '自动耗课':'green','请假标记':'orange','补请假':'orange','补请假（撤销整节课）':'orange','取消请假':'blue','报名缴费':'blue','新增学员':'blue','编辑学员':'gray','新增老师':'blue','规则修改':'red','登录':'gray','数据导入':'red','数据清空':'red',
+    '学员退费':'red','撤销退费':'orange','成本支出':'orange','删除支出':'red' };
   if(!data.logs.length) h+='<div class="card"><div class="empty">暂无日志</div></div>';
   else{
     h+='<div class="card">';
